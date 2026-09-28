@@ -1,0 +1,5 @@
+streamlit
+yfinance
+pandas
+numpy
+pandas_market_calendars
