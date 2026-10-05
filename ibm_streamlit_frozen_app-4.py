@@ -1,0 +1,424 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import pandas_market_calendars as mcal
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+st.set_page_config(page_title="Frozen Signal Scanner", page_icon="📈", layout="centered")
+NY = ZoneInfo("America/New_York")
+
+# ---------------- shared helpers ----------------
+def nyse_sessions(start, end):
+    cal = mcal.get_calendar("NYSE")
+    return cal.schedule(start_date=start, end_date=end).index.tz_localize(None).normalize()
+
+def nth_session(entry_day, n):
+    ss = nyse_sessions(entry_day, pd.Timestamp(entry_day) + pd.Timedelta(days=45))
+    ss = ss[ss >= pd.Timestamp(entry_day).normalize()]
+    return ss[n-1] if len(ss) >= n else None
+
+def completed_today_cutoff(d):
+    now = datetime.now(NY)
+    today = pd.Timestamp(now.date())
+    return d[d["date"] < today].copy() if now.time() < time(16, 5) else d.copy()
+
+# ---------------- IBM frozen strategy ----------------
+def ibm_structure(raw):
+    x = raw.copy().reset_index(drop=True)
+    ph=(x.high.shift(2)>x.high.shift(3))&(x.high.shift(2)>x.high.shift(4))&(x.high.shift(2)>=x.high.shift(1))&(x.high.shift(2)>=x.high)
+    pl=(x.low.shift(2)<x.low.shift(3))&(x.low.shift(2)<x.low.shift(4))&(x.low.shift(2)<=x.low.shift(1))&(x.low.shift(2)<=x.low)
+    x["new_ph"]=ph.fillna(False); x["new_pl"]=pl.fillna(False)
+    x["pivot_hi"]=np.where(x.new_ph,x.high.shift(2),np.nan)
+    x["pivot_lo"]=np.where(x.new_pl,x.low.shift(2),np.nan)
+    lh=phh=ll=pll=np.nan; rows=[]
+    for _,r in x.iterrows():
+        if r.new_ph: phh,lh=lh,r.pivot_hi
+        if r.new_pl: pll,ll=ll,r.pivot_lo
+        rows.append((lh,phh,ll,pll))
+    x[["last_hi","prev_hi","last_lo","prev_lo"]]=pd.DataFrame(rows,index=x.index)
+    x["hi_state"]=pd.Series(np.where(x.new_ph,np.where(x.last_hi>x.prev_hi,"HH","LH"),None)).ffill()
+    x["lo_state"]=pd.Series(np.where(x.new_pl,np.where(x.last_lo>x.prev_lo,"HL","LL"),None)).ffill()
+    x["bull_struct"]=(x.hi_state=="HH")&(x.lo_state=="HL")
+    x["bear_struct"]=(x.hi_state=="LH")&(x.lo_state=="LL")
+    return x
+
+def ibm_daily(h):
+    x=h.copy(); x["day"]=x.date.dt.normalize()
+    return x.groupby("day",as_index=False).agg(date=("day","first"),open=("open","first"),
+        high=("high","max"),low=("low","min"),close=("close","last"),volume=("volume","sum"))
+
+def ibm_fourhour(h):
+    x=h.copy(); x["day"]=x.date.dt.normalize()
+    x["slot"]=x.groupby("day").cumcount()//4
+    return x.groupby(["day","slot"],as_index=False).agg(date=("date","last"),open=("open","first"),
+        high=("high","max"),low=("low","min"),close=("close","last"),volume=("volume","sum")).drop(columns=["slot"])
+
+@st.cache_data(ttl=900)
+def ibm_fetch():
+    z=yf.download("IBM",period="729d",interval="1h",auto_adjust=False,prepost=False,progress=False,threads=False,timeout=10)
+    if z.empty: raise RuntimeError("Yahoo returned no IBM hourly data.")
+    if isinstance(z.columns,pd.MultiIndex): z.columns=z.columns.get_level_values(0)
+    z=z.reset_index(); dc="Datetime" if "Datetime" in z.columns else "Date"
+    dt=pd.to_datetime(z[dc],utc=True).dt.tz_convert(NY)
+    z=pd.DataFrame({"date":dt.dt.tz_localize(None),"open":z["Open"],"high":z["High"],
+                    "low":z["Low"],"close":z["Close"],"volume":z["Volume"]})
+    z=z.dropna().sort_values("date")
+    tm=z.date.dt.time
+    return z[(tm>=time(9,30))&(tm<time(16,0))].reset_index(drop=True)
+
+def ibm_build(h):
+    d=ibm_structure(ibm_daily(h)); q=ibm_structure(ibm_fourhour(h))
+    q["day"]=q.date.dt.normalize(); ql=q.groupby("day").tail(1).set_index("day")
+    d["day"]=d.date.dt.normalize()
+    d["h4_hi"]=d.day.map(ql.hi_state); d["h4_lo"]=d.day.map(ql.lo_state)
+    d["h4_bull"]=d.day.map(ql.bull_struct).fillna(False).astype(bool)
+    d["h4_swing_low"]=d.day.map(ql.last_lo)
+    d["signal"]=d.bear_struct & d.h4_bull
+    return d
+
+def scan_ibm():
+    h=ibm_fetch(); d=completed_today_cutoff(ibm_build(h))
+    if d.empty: raise RuntimeError("No completed IBM session.")
+    r=d.iloc[-1]; day=pd.Timestamp(r.date).normalize()
+    sl=float(r.h4_swing_low) if pd.notna(r.h4_swing_low) else np.nan
+    status="NO SIGNAL"; detail="No frozen IBM pattern."
+    if bool(r.signal) and np.isfinite(sl):
+        future=nyse_sessions(day+pd.Timedelta(days=1),day+pd.Timedelta(days=45))
+        ed=future[0] if len(future) else None
+        status="SIGNAL"; detail=f"LONG next open | SL ${sl:.2f} | TP = entry + 2R"
+        if ed is not None:
+            detail += f" | expected entry {ed.date()} | max exit {nth_session(ed,10).date()}"
+    elif len(d)>=2 and bool(d.iloc[-2].signal):
+        pr=d.iloc[-2]; psl=float(pr.h4_swing_low); entry=float(r.open)
+        if psl < entry:
+            tp=entry+2*(entry-psl)
+            status="ENTRY"
+            detail=f"Prior-session signal | entry ${entry:.2f} | SL ${psl:.2f} | TP ${tp:.2f} | max exit {nth_session(day,10).date()}"
+    return {"ticker":"IBM","status":status,"detail":detail,"date":day.date(),
+            "close":float(r.close),"extra":f"Daily {r.hi_state}+{r.lo_state} | 4h {r.h4_hi}+{r.h4_lo}"}
+
+# ---------------- Visa frozen strategy ----------------
+@st.cache_data(ttl=900)
+def v_fetch():
+    z=yf.download("V",period="2y",interval="1d",auto_adjust=False,progress=False,threads=False,timeout=10)
+    if z.empty: raise RuntimeError("Yahoo returned no V daily data.")
+    if isinstance(z.columns,pd.MultiIndex): z.columns=z.columns.get_level_values(0)
+    z=z.reset_index()
+    z["date"]=pd.to_datetime(z["Date"]).dt.tz_localize(None)
+    d=pd.DataFrame({"date":z["date"],"open":z["Open"],"high":z["High"],"low":z["Low"],
+                    "close":z["Close"],"volume":z["Volume"]}).dropna().sort_values("date").reset_index(drop=True)
+    # EXACT frozen v2 definition used in the backtest:
+    d["lo20"]=d.low.rolling(20).min().shift(1)
+    d["bear"]=d.close<d.open
+    d["sup_touch"]=(d.low-d.lo20).abs()/d.close < .0075
+    d["signal"]=d.bear & d.sup_touch
+    pc=d.close.shift(1)
+    tr=pd.concat([(d.high-d.low),(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
+    d["atr14"]=tr.rolling(14).mean()
+    return d
+
+def scan_v():
+    d=completed_today_cutoff(v_fetch())
+    if d.empty: raise RuntimeError("No completed V session.")
+    r=d.iloc[-1]; day=pd.Timestamp(r.date).normalize()
+    status="NO SIGNAL"; detail="No frozen V bear_sup_touch pattern."
+    if bool(r.signal) and pd.notna(r.atr14):
+        future=nyse_sessions(day+pd.Timedelta(days=1),day+pd.Timedelta(days=20))
+        ed=future[0] if len(future) else None
+        dist=2*float(r.atr14)
+        status="SIGNAL"
+        detail=f"LONG next open | SL = entry − ${dist:.2f} | TP = entry + ${2*dist:.2f}"
+        if ed is not None: detail += f" | expected entry {ed.date()} | max exit {nth_session(ed,3).date()}"
+    elif len(d)>=2 and bool(d.iloc[-2].signal) and pd.notna(d.iloc[-2].atr14):
+        pr=d.iloc[-2]; entry=float(r.open); dist=2*float(pr.atr14)
+        status="ENTRY"
+        detail=f"Prior-session signal | entry ${entry:.2f} | SL ${entry-dist:.2f} | TP ${entry+2*dist:.2f} | max exit {nth_session(day,3).date()}"
+    return {"ticker":"V","status":status,"detail":detail,"date":day.date(),
+            "close":float(r.close),"extra":f"20d support ${float(r.lo20):.2f} | ATR14 ${float(r.atr14):.2f}"}
+
+# ---------------- WFC frozen earnings strategy ----------------
+@st.cache_data(ttl=3600)
+def wfc_fetch():
+    t=yf.Ticker("WFC")
+    cal=t.calendar
+    hist=t.get_earnings_dates(limit=16)
+    px=yf.download("WFC",period="3mo",interval="1d",auto_adjust=False,progress=False,threads=False,timeout=10)
+    if isinstance(px.columns,pd.MultiIndex): px.columns=px.columns.get_level_values(0)
+    return cal,hist,px
+
+def scan_wfc():
+    cal,hist,px=wfc_fetch()
+    today=pd.Timestamp(datetime.now(NY).date())
+    dates=[]
+    if hist is not None and len(hist):
+        z=pd.to_datetime(hist.index)
+        try: z=z.tz_localize(None)
+        except TypeError: z=z.tz_convert(None)
+        dates += list(z)
+    if isinstance(cal,dict):
+        vals=cal.get("Earnings Date",[])
+        if not isinstance(vals,(list,tuple)): vals=[vals]
+        for v in vals:
+            if v is not None:
+                q=pd.Timestamp(v)
+                if q.tzinfo: q=q.tz_localize(None)
+                dates.append(q)
+    dates=sorted(set(dates))
+    up=[d for d in dates if d.normalize()>=today]
+    past=[d for d in dates if d.normalize()<today]
+    next_e=up[0] if up else None; last=past[-1] if past else None
+
+    close=np.nan; atr=np.nan
+    if px is not None and len(px)>20:
+        prev=px["Close"].shift(1)
+        tr=pd.concat([(px["High"]-px["Low"]),(px["High"]-prev).abs(),(px["Low"]-prev).abs()],axis=1).max(axis=1)
+        atr=float(tr.rolling(14).mean().iloc[-1]); close=float(px["Close"].iloc[-1])
+
+    status="NO SIGNAL"; detail="No current WFC earnings entry."
+    # Yahoo calendar date alone does not reliably encode before-open vs after-close timing.
+    if last is not None and (today-last.normalize()).days<=4:
+        status="VERIFY"
+        detail=f"Earnings reported {last.date()} — verify release time; valid entry is the first regular-session open AFTER the release."
+    elif next_e is not None:
+        detail=f"Next reported earnings date: {next_e.date()} ({(next_e.normalize()-today).days} days)"
+    return {"ticker":"WFC","status":status,"detail":detail,"date":today.date(),
+            "close":close,"extra":(f"ATR14 ${atr:.2f}" if np.isfinite(atr) else "ATR unavailable")}
+
+
+# ---------------- AAPL frozen strategy ----------------
+@st.cache_data(ttl=900)
+def aapl_fetch():
+    z=yf.download("AAPL",period="2y",interval="1d",auto_adjust=False,progress=False,threads=False,timeout=10)
+    if z.empty: raise RuntimeError("Yahoo returned no AAPL daily data.")
+    if isinstance(z.columns,pd.MultiIndex): z.columns=z.columns.get_level_values(0)
+    z=z.reset_index()
+    z["date"]=pd.to_datetime(z["Date"]).dt.tz_localize(None)
+    d=pd.DataFrame({"date":z["date"],"open":z["Open"],"high":z["High"],"low":z["Low"],
+                    "close":z["Close"],"volume":z["Volume"]}).dropna().sort_values("date").reset_index(drop=True)
+
+    # EXACT frozen Stage-1 definition:
+    d["hi20"]=d.high.rolling(20).max().shift(1)
+    d["res_touch"]=(d.high-d.hi20).abs()/d.close < .0075
+    prior_res=d.res_touch.astype(int).shift(1).rolling(20).sum()
+    d["break_res"]=d.close>d.hi20
+    d["bull"]=d.close>d.open
+    d["signal"]=d.bull & d.break_res & (prior_res>=2)
+
+    pc=d.close.shift(1)
+    tr=pd.concat([(d.high-d.low),(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
+    d["atr14"]=tr.rolling(14).mean()
+    d["prior_res_touches"]=prior_res
+    return d
+
+def scan_aapl():
+    d=completed_today_cutoff(aapl_fetch())
+    if d.empty: raise RuntimeError("No completed AAPL session.")
+    r=d.iloc[-1]; day=pd.Timestamp(r.date).normalize()
+    status="NO SIGNAL"; detail="No frozen AAPL bull_break_res_after_2plus pattern."
+    if bool(r.signal) and pd.notna(r.atr14):
+        future=nyse_sessions(day+pd.Timedelta(days=1),day+pd.Timedelta(days=30))
+        ed=future[0] if len(future) else None
+        dist=1.5*float(r.atr14)
+        status="SIGNAL"
+        detail=f"LONG next open | SL = entry − ${dist:.2f} | TP = entry + ${2*dist:.2f}"
+        if ed is not None: detail += f" | expected entry {ed.date()} | max exit {nth_session(ed,10).date()}"
+    elif len(d)>=2 and bool(d.iloc[-2].signal) and pd.notna(d.iloc[-2].atr14):
+        pr=d.iloc[-2]; entry=float(r.open); dist=1.5*float(pr.atr14)
+        status="ENTRY"
+        detail=f"Prior-session signal | entry ${entry:.2f} | SL ${entry-dist:.2f} | TP ${entry+2*dist:.2f} | max exit {nth_session(day,10).date()}"
+    touches=int(r.prior_res_touches) if pd.notna(r.prior_res_touches) else 0
+    return {"ticker":"AAPL","status":status,"detail":detail,"date":day.date(),
+            "close":float(r.close),"extra":f"Prior 20d resistance ${float(r.hi20):.2f} | prior resistance touches {touches} | ATR14 ${float(r.atr14):.2f}"}
+
+
+# ---------------- GOOG frozen strategy ----------------
+@st.cache_data(ttl=900)
+def goog_fetch():
+    z=yf.download("GOOG",period="2y",interval="1d",auto_adjust=False,progress=False,threads=False,timeout=10)
+    if z.empty: raise RuntimeError("Yahoo returned no GOOG daily data.")
+    if isinstance(z.columns,pd.MultiIndex): z.columns=z.columns.get_level_values(0)
+    z=z.reset_index()
+    z["date"]=pd.to_datetime(z["Date"]).dt.tz_localize(None)
+    d=pd.DataFrame({"date":z["date"],"open":z["Open"],"high":z["High"],"low":z["Low"],
+                    "close":z["Close"],"volume":z["Volume"]}).dropna().sort_values("date").reset_index(drop=True)
+    # EXACT frozen Stage-1 definition: weekday_2_after_down.
+    # pandas weekday 2 = Wednesday; prior completed daily candle must be down.
+    d["down"]=d.close<d.open
+    d["signal"]=(d.date.dt.weekday==2) & d.down.shift(1).fillna(False)
+    pc=d.close.shift(1)
+    tr=pd.concat([(d.high-d.low),(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
+    d["atr14"]=tr.rolling(14).mean()
+    return d
+
+def scan_goog():
+    d=completed_today_cutoff(goog_fetch())
+    if d.empty: raise RuntimeError("No completed GOOG session.")
+    r=d.iloc[-1]; day=pd.Timestamp(r.date).normalize()
+    status="NO SIGNAL"; detail="No frozen GOOG weekday_2_after_down pattern."
+    if bool(r.signal) and pd.notna(r.atr14):
+        future=nyse_sessions(day+pd.Timedelta(days=1),day+pd.Timedelta(days=30))
+        ed=future[0] if len(future) else None
+        dist=2*float(r.atr14)
+        status="SIGNAL"
+        detail=f"LONG next open | SL = entry − ${dist:.2f} | TP = entry + ${2*dist:.2f}"
+        if ed is not None: detail += f" | expected entry {ed.date()} | max exit {nth_session(ed,10).date()}"
+    elif len(d)>=2 and bool(d.iloc[-2].signal) and pd.notna(d.iloc[-2].atr14):
+        pr=d.iloc[-2]; entry=float(r.open); dist=2*float(pr.atr14)
+        status="ENTRY"
+        detail=f"Prior-session signal | entry ${entry:.2f} | SL ${entry-dist:.2f} | TP ${entry+2*dist:.2f} | max exit {nth_session(day,10).date()}"
+    return {"ticker":"GOOG","status":status,"detail":detail,"date":day.date(),
+            "close":float(r.close),"extra":f"weekday {day.day_name()} | prior session {'down' if len(d)>=2 and d.iloc[-2].down else 'up'} | ATR14 ${float(r.atr14):.2f}"}
+
+
+import types
+def _embedded_scanner(name, source):
+    module=types.ModuleType(name)
+    exec(compile(source,name,"exec"),module.__dict__)
+    return module
+ibm = _embedded_scanner('embedded_ibm', '#!/usr/bin/env python3\n"""Frozen IBM close-location UPPER v1 scanner adapter.\nNo broker or internet. Dependencies pandas numpy matplotlib.\npython ibm_close_location_frozen_v1.py --csv IBM_daily_TRADES.csv\n"""\nimport argparse,json\nfrom pathlib import Path\nimport numpy as np\nimport pandas as pd\ndef wilder(s, n=14):\n    # Wilder seed is arithmetic mean of first n valid observations.\n    out = pd.Series(np.nan, index=s.index)\n    valid = np.flatnonzero(s.notna().to_numpy())\n    if len(valid) < n:\n        return out\n    k = valid[n-1]\n    out.iloc[k] = s.iloc[valid[:n]].mean()\n    for i in range(k+1, len(s)):\n        out.iloc[i] = (out.iloc[i-1]*(n-1)+s.iloc[i])/n\n    return out\n\ndef indicators(d):\n    d = d.copy()\n    for n in [20, 50, 200]:\n        d[f\'sma{n}\'] = d.close.rolling(n).mean()\n    delta = d.close.diff()\n    up, down = wilder(delta.clip(lower=0)), wilder(-delta.clip(upper=0))\n    d[\'rsi\'] = 100 - 100/(1+up/down)\n    d.loc[(up == 0) & (down == 0), \'rsi\'] = 50\n    tr = pd.concat([d.high-d.low, (d.high-d.close.shift()).abs(),\n                    (d.low-d.close.shift()).abs()], axis=1).max(axis=1)\n    d[\'atr\'] = wilder(tr)\n    d[\'prior_high\'] = d.close.shift().rolling(20).max()\n    # Prompt uses current-session volume in its 20-day volume average.\n    d[\'vol20\'] = d.volume.rolling(20).mean()\n    d[\'ret\'] = d.close.pct_change(fill_method=None)\n    return d\n\ndef load_csv(path):\n    import io,csv\n    text=path.read_text(encoding=\'utf-8-sig\')\n    lines=text.splitlines();start=None;sep=\',\'\n    for k,line in enumerate(lines):\n        for delimiter in [\',\',\';\',\'\\t\']:\n            columns=[c.strip().lower().strip(\'"\') for c in next(csv.reader([line],delimiter=delimiter))]\n            if all(c in columns for c in [\'date\',\'open\',\'high\',\'low\',\'close\',\'volume\']):\n                start=k;sep=delimiter;break\n        if start is not None:break\n    if start is None:raise ValueError(str(path)+\': no Date/Open/High/Low/Close/Volume header found\')\n    d=pd.read_csv(io.StringIO(\'\\n\'.join(lines[start:])),sep=sep)\n    d.columns=d.columns.str.strip().str.lower();d[\'date\']=pd.to_datetime(d.date,errors=\'raise\')\n    d[\'date\']=d.date.dt.tz_localize(None).dt.normalize();d=d.set_index(\'date\')[[\'open\',\'high\',\'low\',\'close\',\'volume\']]\n    for c in d.columns:d[c]=pd.to_numeric(d[c].astype(str).str.replace(\',\',\'\',regex=False),errors=\'raise\')\n    d=d.sort_index()\n    if d.index.duplicated().any():raise ValueError(str(path)+\': duplicate dates\')\n    if d.isna().any().any() or (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any():raise ValueError(str(path)+\': invalid prices\')\n    if ((d.high<d[[\'open\',\'close\',\'low\']].max(axis=1))|(d.low>d[[\'open\',\'close\',\'high\']].min(axis=1))).any():raise ValueError(str(path)+\': inconsistent OHLC\')\n    return d\n\n\nCONFIG={\n \'strategy_id\':\'IBM_CLOSE_LOCATION_UPPER_V1\',\'ticker\':\'IBM\',\'direction\':\'LONG\',\n \'indicator\':\'sum5(((2*close-high-low)/(high-low))*(volume/SMA20(volume)))\',\n \'tail\':\'upper\',\'quantile\':0.025,\'band_valid_observations\':252,\'band_min_valid_observations\':200,\n \'trend\':\'close>SMA200\',\'entry\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\n \'stop_ATR_multiple\':2.0,\'ATR_period\':14,\'target\':None,\'max_hold_sessions\':10,\n \'exit\':\'first strictly net-profitable completed close queues next regular open; gap SL takes priority\',\n \'lockout_signal_sessions\':10,\'roundtrip_bps\':10,\'cash_interest\':0,\n \'historical_window\':[\'2019-06-12\',\'2026-10-01\'],\n \'status\':\'Frozen exploratory candidate, not statistically confirmed\',\n \'reported_audit_10bps\':{\'trades\':31,\'ending_equity\':10874.9461,\'win_rate_pct\':83.8710,\'profit_factor\':3.4402}\n}\n\ndef prepare_bars(bars):\n    """Caller supplies completed regular-session DAILY IBM bars only. Never fill missing prices.\n    Use the same historical series/warmup as the audit for exact indicator agreement.\n    """\n    d=bars.copy();d.columns=d.columns.str.lower().str.strip()\n    if \'date\' in d:d[\'date\']=pd.to_datetime(d.date);d=d.set_index(\'date\')\n    d.index=pd.DatetimeIndex(d.index).tz_localize(None).normalize();d=d.sort_index()\n    cols=[\'open\',\'high\',\'low\',\'close\',\'volume\'];d=d[cols].apply(pd.to_numeric,errors=\'raise\')\n    if d.index.duplicated().any() or d.isna().any().any():raise ValueError(\'Duplicate dates or missing OHLCV; no price filling permitted\')\n    if (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any() or (d.volume<0).any():raise ValueError(\'Invalid price/volume\')\n    if ((d.high<d[[\'open\',\'low\',\'close\']].max(axis=1))|(d.low>d[[\'open\',\'high\',\'close\']].min(axis=1))).any():raise ValueError(\'Invalid OHLC ordering\')\n    return indicators(d)\n\ndef signal_history(completed_daily_bars):\n    d=prepare_bars(completed_daily_bars)\n    spread=d.high-d.low\n    location=(2*d.close-d.high-d.low)/spread.where(spread.abs()>1e-8)\n    value=(location*(d.volume/d.vol20)).rolling(5).sum()\n    # Exactly prior252 VALID indicator values; today\'s value excluded.\n    band=value.dropna().shift(1).rolling(252,min_periods=200).quantile(.975).reindex(d.index)\n    raw=((value>band)&(d.close>d.sma200)&value.notna()&band.notna()&(d.atr>0)).fillna(False)\n    accepted=np.zeros(len(d),dtype=bool);next_allowed=0\n    for j in np.flatnonzero(raw.to_numpy()):\n        if j>=next_allowed:accepted[j]=True;next_allowed=j+10\n    d[\'synthetic_indicator\']=value;d[\'upper_band\']=band;d[\'raw_signal\']=raw;d[\'accepted_signal\']=accepted\n    return d\n\ndef scan_ibm(completed_daily_bars,has_open_position=False):\n    """Master integration: call after full daily close. No live/partial candle allowed.\n    Returns signal only; master controls available cash/slots, order submission and calendar.\n    Accepted signals retain frozen H10 lockout even if trade exited earlier or master skipped it.\n    """\n    d=signal_history(completed_daily_bars)\n    if not len(d):raise ValueError(\'No bars\')\n    row=d.iloc[-1];j=len(d)-1;prior=np.flatnonzero(d.accepted_signal.to_numpy()[:j]);last=int(prior[-1]) if len(prior) else None\n    cooldown=last is not None and j<last+10\n    ready=bool(np.isfinite(row.upper_band) and np.isfinite(row.atr) and np.isfinite(row.sma200))\n    buy=ready and bool(row.accepted_signal) and not has_open_position\n    status=\'BUY_NEXT_REGULAR_OPEN\' if buy else (\'POSITION_OPEN\' if has_open_position else (\'WARMUP\' if not ready else (\'COOLDOWN\' if cooldown else \'NO_SIGNAL\')))\n    return {\'strategy_id\':CONFIG[\'strategy_id\'],\'ticker\':\'IBM\',\'signal_date\':str(d.index[-1].date()),\'status\':status,\'buy_signal\':buy,\n      \'indicator\':float(row.synthetic_indicator) if pd.notna(row.synthetic_indicator) else None,\n      \'upper_band\':float(row.upper_band) if pd.notna(row.upper_band) else None,\'close\':float(row.close),\n      \'SMA200\':float(row.sma200) if pd.notna(row.sma200) else None,\'signal_ATR14\':float(row.atr) if pd.notna(row.atr) else None,\n      \'raw_signal\':bool(row.raw_signal),\'cooldown_sessions_remaining\':max(0,last+10-j) if last is not None else 0,\n      \'entry_plan\':{\'when\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\'SL_formula\':\'actual_entry_open - 2 * signal_ATR14\',\'TP\':None,\'max_hold_sessions\':10,\'entry_session_counts_as\':1} if buy else None}\n\ndef build_entry(actual_entry_open,signal_ATR14,current_equity,available_cash,roundtrip_bps=10):\n    """Only call on execution day with actual opening price and frozen signal-day ATR."""\n    op=float(actual_entry_open);atr=float(signal_ATR14);fee=roundtrip_bps/20000;cost=.333*current_equity\n    if not np.isfinite(op) or not np.isfinite(atr) or atr<=0 or op-2*atr<=0:raise ValueError(\'Invalid entry or stop\')\n    if available_cash+1e-8<cost:return {\'status\':\'SKIP_INSUFFICIENT_CASH\'}\n    return {\'status\':\'ENTRY_PLAN\',\'entry_open\':op,\'SL\':op-2*atr,\'TP\':None,\'shares\':cost/(op*(1+fee)),\'entry_budget_including_cost\':cost,\'roundtrip_bps\':roundtrip_bps}\n\ndef completed_close_exit_signal(close,entry_open,holding_session,roundtrip_bps=10):\n    """Call AFTER processing today\'s intraday stop, only if position still open.\n    No fixed TP. At session10 close, time exit has precedence over queued profit exit.\n    Queue profit exit for next open; actual next-open trade may be a loss.\n    """\n    fee=roundtrip_bps/20000\n    if holding_session>=10:return \'EXIT_THIS_CLOSE_MAX_HOLD\'\n    if close*(1-fee)>entry_open*(1+fee):return \'QUEUE_EXIT_NEXT_REGULAR_OPEN\'\n    return \'HOLD_WITH_STOP\'\n\ndef opening_exit(open_price,stop_price,profit_exit_queued):\n    if open_price<=stop_price:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'gap_SL\'}\n    if profit_exit_queued:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'profitable_close_next_open\'}\n    return {\'exit\':False}\n\ndef main():\n    p=argparse.ArgumentParser(description=__doc__);p.add_argument(\'--csv\',type=Path,default=Path(\'IBM_daily_TRADES.csv\'));p.add_argument(\'--asof\',help=\'Last completed regular-session date YYYY-MM-DD\');a=p.parse_args()\n    d=load_csv(a.csv)\n    if a.asof:d=d.loc[:a.asof]\n    print(json.dumps(scan_ibm(d),indent=2,allow_nan=False))\nif __name__==\'__main__\':main()\n')
+crwd = _embedded_scanner('embedded_crwd', '#!/usr/bin/env python3\n"""Frozen CRWD close-location LOWER v1 scanner adapter.\nNo broker or internet. Dependencies pandas numpy matplotlib.\npython crwd_close_location_frozen_v1.py --csv CRWD_daily_TRADES.csv\n"""\nimport argparse,json\nfrom pathlib import Path\nimport numpy as np\nimport pandas as pd\ndef wilder(s, n=14):\n    # Wilder seed is arithmetic mean of first n valid observations.\n    out = pd.Series(np.nan, index=s.index)\n    valid = np.flatnonzero(s.notna().to_numpy())\n    if len(valid) < n:\n        return out\n    k = valid[n-1]\n    out.iloc[k] = s.iloc[valid[:n]].mean()\n    for i in range(k+1, len(s)):\n        out.iloc[i] = (out.iloc[i-1]*(n-1)+s.iloc[i])/n\n    return out\n\ndef indicators(d):\n    d = d.copy()\n    for n in [20, 50, 200]:\n        d[f\'sma{n}\'] = d.close.rolling(n).mean()\n    delta = d.close.diff()\n    up, down = wilder(delta.clip(lower=0)), wilder(-delta.clip(upper=0))\n    d[\'rsi\'] = 100 - 100/(1+up/down)\n    d.loc[(up == 0) & (down == 0), \'rsi\'] = 50\n    tr = pd.concat([d.high-d.low, (d.high-d.close.shift()).abs(),\n                    (d.low-d.close.shift()).abs()], axis=1).max(axis=1)\n    d[\'atr\'] = wilder(tr)\n    d[\'prior_high\'] = d.close.shift().rolling(20).max()\n    # Prompt uses current-session volume in its 20-day volume average.\n    d[\'vol20\'] = d.volume.rolling(20).mean()\n    d[\'ret\'] = d.close.pct_change(fill_method=None)\n    return d\n\ndef load_csv(path):\n    import io,csv\n    text=path.read_text(encoding=\'utf-8-sig\')\n    lines=text.splitlines();start=None;sep=\',\'\n    for k,line in enumerate(lines):\n        for delimiter in [\',\',\';\',\'\\t\']:\n            columns=[c.strip().lower().strip(\'"\') for c in next(csv.reader([line],delimiter=delimiter))]\n            if all(c in columns for c in [\'date\',\'open\',\'high\',\'low\',\'close\',\'volume\']):\n                start=k;sep=delimiter;break\n        if start is not None:break\n    if start is None:raise ValueError(str(path)+\': no Date/Open/High/Low/Close/Volume header found\')\n    d=pd.read_csv(io.StringIO(\'\\n\'.join(lines[start:])),sep=sep)\n    d.columns=d.columns.str.strip().str.lower();d[\'date\']=pd.to_datetime(d.date,errors=\'raise\')\n    d[\'date\']=d.date.dt.tz_localize(None).dt.normalize();d=d.set_index(\'date\')[[\'open\',\'high\',\'low\',\'close\',\'volume\']]\n    for c in d.columns:d[c]=pd.to_numeric(d[c].astype(str).str.replace(\',\',\'\',regex=False),errors=\'raise\')\n    d=d.sort_index()\n    if d.index.duplicated().any():raise ValueError(str(path)+\': duplicate dates\')\n    if d.isna().any().any() or (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any():raise ValueError(str(path)+\': invalid prices\')\n    if ((d.high<d[[\'open\',\'close\',\'low\']].max(axis=1))|(d.low>d[[\'open\',\'close\',\'high\']].min(axis=1))).any():raise ValueError(str(path)+\': inconsistent OHLC\')\n    return d\n\n\nCONFIG={\n \'strategy_id\':\'CRWD_CLOSE_LOCATION_LOWER_V1\',\'ticker\':\'CRWD\',\'direction\':\'LONG\',\n \'indicator\':\'sum5(((2*close-high-low)/(high-low))*(volume/SMA20(volume)))\',\n \'tail\':\'lower\',\'quantile\':0.025,\'band_valid_observations\':252,\'band_min_valid_observations\':200,\n \'trend\':\'close>SMA200\',\'entry\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\n \'stop_ATR_multiple\':2.0,\'ATR_period\':14,\'target\':None,\'max_hold_sessions\':10,\n \'exit\':\'first strictly net-profitable completed close queues next regular open; gap SL takes priority\',\n \'lockout_signal_sessions\':10,\'roundtrip_bps\':10,\'cash_interest\':0,\n \'historical_window\':[\'2019-06-12\',\'2026-10-01\'],\n \'status\':\'Frozen exploratory candidate, not statistically confirmed\',\n \'reported_audit_10bps\':{\'trades\':15,\'ending_equity\':11303.7768,\'win_rate_pct\':86.6667,\'profit_factor\':5.4422,\'mean_trade_pct\':2.4855,\'MaxDD_pct\':-3.0929,\'CAGR_pct\':1.6913,\'matched_null_p\':0.023,\'bonferroni60_p\':1.0}\n}\n\ndef prepare_bars(bars):\n    """Caller supplies completed regular-session DAILY CRWD bars only. Never fill missing prices.\n    Use the same historical series/warmup as the audit for exact indicator agreement.\n    """\n    d=bars.copy();d.columns=d.columns.str.lower().str.strip()\n    if \'date\' in d:d[\'date\']=pd.to_datetime(d.date);d=d.set_index(\'date\')\n    d.index=pd.DatetimeIndex(d.index).tz_localize(None).normalize();d=d.sort_index()\n    cols=[\'open\',\'high\',\'low\',\'close\',\'volume\'];d=d[cols].apply(pd.to_numeric,errors=\'raise\')\n    if d.index.duplicated().any() or d.isna().any().any():raise ValueError(\'Duplicate dates or missing OHLCV; no price filling permitted\')\n    if (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any() or (d.volume<0).any():raise ValueError(\'Invalid price/volume\')\n    if ((d.high<d[[\'open\',\'low\',\'close\']].max(axis=1))|(d.low>d[[\'open\',\'high\',\'close\']].min(axis=1))).any():raise ValueError(\'Invalid OHLC ordering\')\n    return indicators(d)\n\ndef signal_history(completed_daily_bars):\n    d=prepare_bars(completed_daily_bars)\n    spread=d.high-d.low\n    location=(2*d.close-d.high-d.low)/spread.where(spread.abs()>1e-8)\n    value=(location*(d.volume/d.vol20)).rolling(5).sum()\n    # Exactly prior252 VALID indicator values; today\'s value excluded.\n    band=value.dropna().shift(1).rolling(252,min_periods=200).quantile(.025).reindex(d.index)\n    raw=((value<band)&(d.close>d.sma200)&value.notna()&band.notna()&(d.atr>0)).fillna(False)\n    accepted=np.zeros(len(d),dtype=bool);next_allowed=0\n    for j in np.flatnonzero(raw.to_numpy()):\n        if j>=next_allowed:accepted[j]=True;next_allowed=j+10\n    d[\'synthetic_indicator\']=value;d[\'lower_band\']=band;d[\'raw_signal\']=raw;d[\'accepted_signal\']=accepted\n    return d\n\ndef scan_crwd(completed_daily_bars,has_open_position=False):\n    """Master integration: call after full daily close. No live/partial candle allowed.\n    Returns signal only; master controls available cash/slots, order submission and calendar.\n    Accepted signals retain frozen H10 lockout even if trade exited earlier or master skipped it.\n    """\n    d=signal_history(completed_daily_bars)\n    if not len(d):raise ValueError(\'No bars\')\n    row=d.iloc[-1];j=len(d)-1;prior=np.flatnonzero(d.accepted_signal.to_numpy()[:j]);last=int(prior[-1]) if len(prior) else None\n    cooldown=last is not None and j<last+10\n    ready=bool(np.isfinite(row.lower_band) and np.isfinite(row.atr) and np.isfinite(row.sma200))\n    buy=ready and bool(row.accepted_signal) and not has_open_position\n    status=\'BUY_NEXT_REGULAR_OPEN\' if buy else (\'POSITION_OPEN\' if has_open_position else (\'WARMUP\' if not ready else (\'COOLDOWN\' if cooldown else \'NO_SIGNAL\')))\n    return {\'strategy_id\':CONFIG[\'strategy_id\'],\'ticker\':\'CRWD\',\'signal_date\':str(d.index[-1].date()),\'status\':status,\'buy_signal\':buy,\n      \'indicator\':float(row.synthetic_indicator) if pd.notna(row.synthetic_indicator) else None,\n      \'lower_band\':float(row.lower_band) if pd.notna(row.lower_band) else None,\'close\':float(row.close),\n      \'SMA200\':float(row.sma200) if pd.notna(row.sma200) else None,\'signal_ATR14\':float(row.atr) if pd.notna(row.atr) else None,\n      \'raw_signal\':bool(row.raw_signal),\'cooldown_sessions_remaining\':max(0,last+10-j) if last is not None else 0,\n      \'entry_plan\':{\'when\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\'SL_formula\':\'actual_entry_open - 2 * signal_ATR14\',\'TP\':None,\'max_hold_sessions\':10,\'entry_session_counts_as\':1} if buy else None}\n\ndef build_entry(actual_entry_open,signal_ATR14,current_equity,available_cash,roundtrip_bps=10):\n    """Only call on execution day with actual opening price and frozen signal-day ATR."""\n    op=float(actual_entry_open);atr=float(signal_ATR14);fee=roundtrip_bps/20000;cost=.333*current_equity\n    if not np.isfinite(op) or not np.isfinite(atr) or atr<=0 or op-2*atr<=0:raise ValueError(\'Invalid entry or stop\')\n    if available_cash+1e-8<cost:return {\'status\':\'SKIP_INSUFFICIENT_CASH\'}\n    return {\'status\':\'ENTRY_PLAN\',\'entry_open\':op,\'SL\':op-2*atr,\'TP\':None,\'shares\':cost/(op*(1+fee)),\'entry_budget_including_cost\':cost,\'roundtrip_bps\':roundtrip_bps}\n\ndef completed_close_exit_signal(close,entry_open,holding_session,roundtrip_bps=10):\n    """Call AFTER processing today\'s intraday stop, only if position still open.\n    No fixed TP. At session10 close, time exit has precedence over queued profit exit.\n    Queue profit exit for next open; actual next-open trade may be a loss.\n    """\n    fee=roundtrip_bps/20000\n    if holding_session>=10:return \'EXIT_THIS_CLOSE_MAX_HOLD\'\n    if close*(1-fee)>entry_open*(1+fee):return \'QUEUE_EXIT_NEXT_REGULAR_OPEN\'\n    return \'HOLD_WITH_STOP\'\n\ndef opening_exit(open_price,stop_price,profit_exit_queued):\n    if open_price<=stop_price:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'gap_SL\'}\n    if profit_exit_queued:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'profitable_close_next_open\'}\n    return {\'exit\':False}\n\ndef main():\n    p=argparse.ArgumentParser(description=__doc__);p.add_argument(\'--csv\',type=Path,default=Path(\'CRWD_daily_TRADES.csv\'));p.add_argument(\'--asof\',help=\'Last completed regular-session date YYYY-MM-DD\');a=p.parse_args()\n    d=load_csv(a.csv)\n    if a.asof:d=d.loc[:a.asof]\n    print(json.dumps(scan_crwd(d),indent=2,allow_nan=False))\nif __name__==\'__main__\':main()\n')
+mrna = _embedded_scanner('embedded_mrna', '#!/usr/bin/env python3\n"""Frozen MRNA volume-per-movement UPPER v1 scanner adapter.\nNo broker or internet. Dependencies pandas numpy matplotlib.\npython mrna_volume_per_movement_frozen_v1.py --csv MRNA_daily_TRADES.csv\n"""\nimport argparse,json\nfrom pathlib import Path\nimport numpy as np\nimport pandas as pd\ndef wilder(s, n=14):\n    # Wilder seed is arithmetic mean of first n valid observations.\n    out = pd.Series(np.nan, index=s.index)\n    valid = np.flatnonzero(s.notna().to_numpy())\n    if len(valid) < n:\n        return out\n    k = valid[n-1]\n    out.iloc[k] = s.iloc[valid[:n]].mean()\n    for i in range(k+1, len(s)):\n        out.iloc[i] = (out.iloc[i-1]*(n-1)+s.iloc[i])/n\n    return out\n\ndef indicators(d):\n    d = d.copy()\n    for n in [20, 50, 200]:\n        d[f\'sma{n}\'] = d.close.rolling(n).mean()\n    delta = d.close.diff()\n    up, down = wilder(delta.clip(lower=0)), wilder(-delta.clip(upper=0))\n    d[\'rsi\'] = 100 - 100/(1+up/down)\n    d.loc[(up == 0) & (down == 0), \'rsi\'] = 50\n    tr = pd.concat([d.high-d.low, (d.high-d.close.shift()).abs(),\n                    (d.low-d.close.shift()).abs()], axis=1).max(axis=1)\n    d[\'atr\'] = wilder(tr)\n    d[\'prior_high\'] = d.close.shift().rolling(20).max()\n    # Prompt uses current-session volume in its 20-day volume average.\n    d[\'vol20\'] = d.volume.rolling(20).mean()\n    d[\'ret\'] = d.close.pct_change(fill_method=None)\n    return d\n\ndef load_csv(path):\n    import io,csv\n    text=path.read_text(encoding=\'utf-8-sig\')\n    lines=text.splitlines();start=None;sep=\',\'\n    for k,line in enumerate(lines):\n        for delimiter in [\',\',\';\',\'\\t\']:\n            columns=[c.strip().lower().strip(\'"\') for c in next(csv.reader([line],delimiter=delimiter))]\n            if all(c in columns for c in [\'date\',\'open\',\'high\',\'low\',\'close\',\'volume\']):\n                start=k;sep=delimiter;break\n        if start is not None:break\n    if start is None:raise ValueError(str(path)+\': no Date/Open/High/Low/Close/Volume header found\')\n    d=pd.read_csv(io.StringIO(\'\\n\'.join(lines[start:])),sep=sep)\n    d.columns=d.columns.str.strip().str.lower();d[\'date\']=pd.to_datetime(d.date,errors=\'raise\')\n    d[\'date\']=d.date.dt.tz_localize(None).dt.normalize();d=d.set_index(\'date\')[[\'open\',\'high\',\'low\',\'close\',\'volume\']]\n    for c in d.columns:d[c]=pd.to_numeric(d[c].astype(str).str.replace(\',\',\'\',regex=False),errors=\'raise\')\n    d=d.sort_index()\n    if d.index.duplicated().any():raise ValueError(str(path)+\': duplicate dates\')\n    if d.isna().any().any() or (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any():raise ValueError(str(path)+\': invalid prices\')\n    if ((d.high<d[[\'open\',\'close\',\'low\']].max(axis=1))|(d.low>d[[\'open\',\'close\',\'high\']].min(axis=1))).any():raise ValueError(str(path)+\': inconsistent OHLC\')\n    return d\n\n\nCONFIG={\n \'strategy_id\':\'MRNA_VOLUME_PER_MOVEMENT_UPPER_V1\',\'ticker\':\'MRNA\',\'direction\':\'LONG\',\n \'indicator\':\'sum5(volume/SMA20(volume)) / sum5(abs(close_return)/(ATR14/close))\',\n \'tail\':\'upper\',\'quantile\':0.975,\'band_valid_observations\':252,\'band_min_valid_observations\':200,\n \'trend\':\'close>SMA200\',\'entry\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\n \'stop_ATR_multiple\':2.0,\'ATR_period\':14,\'target\':None,\'max_hold_sessions\':10,\n \'exit\':\'first strictly net-profitable completed close queues next regular open; gap SL takes priority\',\n \'lockout_signal_sessions\':10,\'roundtrip_bps\':10,\'cash_interest\':0,\n \'historical_window\':[\'2018-12-07\',\'2026-10-01\'],\n \'status\':\'Frozen exploratory candidate, not statistically confirmed\',\n \'reported_audit_10bps\':{\'trades\':15,\'ending_equity\':17209.4652,\'win_rate_pct\':93.3333,\'profit_factor\':294.715,\'mean_trade_pct\':12.4197,\'MaxDD_pct\':-8.0068,\'CAGR_pct\':7.1894,\'matched_null_p\':0.003,\'bonferroni60_p\':0.1798,\'best_trade_removed_equity\':11968.1954,\'note\':\'Headline result heavily influenced by verified August2026 catalyst trade\'}\n}\n\ndef prepare_bars(bars):\n    """Caller supplies completed regular-session DAILY MRNA bars only. Never fill missing prices.\n    Use the same historical series/warmup as the audit for exact indicator agreement.\n    """\n    d=bars.copy();d.columns=d.columns.str.lower().str.strip()\n    if \'date\' in d:d[\'date\']=pd.to_datetime(d.date);d=d.set_index(\'date\')\n    d.index=pd.DatetimeIndex(d.index).tz_localize(None).normalize();d=d.sort_index()\n    cols=[\'open\',\'high\',\'low\',\'close\',\'volume\'];d=d[cols].apply(pd.to_numeric,errors=\'raise\')\n    if d.index.duplicated().any() or d.isna().any().any():raise ValueError(\'Duplicate dates or missing OHLCV; no price filling permitted\')\n    if (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any() or (d.volume<0).any():raise ValueError(\'Invalid price/volume\')\n    if ((d.high<d[[\'open\',\'low\',\'close\']].max(axis=1))|(d.low>d[[\'open\',\'high\',\'close\']].min(axis=1))).any():raise ValueError(\'Invalid OHLC ordering\')\n    return indicators(d)\n\ndef signal_history(completed_daily_bars):\n    d=prepare_bars(completed_daily_bars)\n    r=d.close.pct_change(fill_method=None)\n    movement=r.abs()/(d.atr/d.close).where((d.atr/d.close).abs()>1e-8)\n    denominator=movement.rolling(5).sum()\n    value=(d.volume/d.vol20).rolling(5).sum()/denominator.where(denominator.abs()>1e-8)\n    value=value.replace([np.inf,-np.inf],np.nan)\n    band=value.dropna().shift(1).rolling(252,min_periods=200).quantile(.975).reindex(d.index)\n    raw=((value>band)&(d.close>d.sma200)&value.notna()&band.notna()&(d.atr>0)).fillna(False)\n    accepted=np.zeros(len(d),dtype=bool);next_allowed=0\n    for j in np.flatnonzero(raw.to_numpy()):\n        if j>=next_allowed:accepted[j]=True;next_allowed=j+10\n    d[\'synthetic_indicator\']=value;d[\'upper_band\']=band;d[\'raw_signal\']=raw;d[\'accepted_signal\']=accepted\n    return d\n\ndef scan_mrna(completed_daily_bars,has_open_position=False):\n    """Master integration: call after full daily close. No live/partial candle allowed.\n    Returns signal only; master controls available cash/slots, order submission and calendar.\n    Accepted signals retain frozen H10 lockout even if trade exited earlier or master skipped it.\n    """\n    d=signal_history(completed_daily_bars)\n    if not len(d):raise ValueError(\'No bars\')\n    row=d.iloc[-1];j=len(d)-1;prior=np.flatnonzero(d.accepted_signal.to_numpy()[:j]);last=int(prior[-1]) if len(prior) else None\n    cooldown=last is not None and j<last+10\n    ready=bool(np.isfinite(row.upper_band) and np.isfinite(row.atr) and np.isfinite(row.sma200))\n    buy=ready and bool(row.accepted_signal) and not has_open_position\n    status=\'BUY_NEXT_REGULAR_OPEN\' if buy else (\'POSITION_OPEN\' if has_open_position else (\'WARMUP\' if not ready else (\'COOLDOWN\' if cooldown else \'NO_SIGNAL\')))\n    return {\'strategy_id\':CONFIG[\'strategy_id\'],\'ticker\':\'MRNA\',\'signal_date\':str(d.index[-1].date()),\'status\':status,\'buy_signal\':buy,\n      \'indicator\':float(row.synthetic_indicator) if pd.notna(row.synthetic_indicator) else None,\n      \'upper_band\':float(row.upper_band) if pd.notna(row.upper_band) else None,\'close\':float(row.close),\n      \'SMA200\':float(row.sma200) if pd.notna(row.sma200) else None,\'signal_ATR14\':float(row.atr) if pd.notna(row.atr) else None,\n      \'raw_signal\':bool(row.raw_signal),\'cooldown_sessions_remaining\':max(0,last+10-j) if last is not None else 0,\n      \'entry_plan\':{\'when\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\'SL_formula\':\'actual_entry_open - 2 * signal_ATR14\',\'TP\':None,\'max_hold_sessions\':10,\'entry_session_counts_as\':1} if buy else None}\n\ndef build_entry(actual_entry_open,signal_ATR14,current_equity,available_cash,roundtrip_bps=10):\n    """Only call on execution day with actual opening price and frozen signal-day ATR."""\n    op=float(actual_entry_open);atr=float(signal_ATR14);fee=roundtrip_bps/20000;cost=.333*current_equity\n    if not np.isfinite(op) or not np.isfinite(atr) or atr<=0 or op-2*atr<=0:raise ValueError(\'Invalid entry or stop\')\n    if available_cash+1e-8<cost:return {\'status\':\'SKIP_INSUFFICIENT_CASH\'}\n    return {\'status\':\'ENTRY_PLAN\',\'entry_open\':op,\'SL\':op-2*atr,\'TP\':None,\'shares\':cost/(op*(1+fee)),\'entry_budget_including_cost\':cost,\'roundtrip_bps\':roundtrip_bps}\n\ndef completed_close_exit_signal(close,entry_open,holding_session,roundtrip_bps=10):\n    """Call AFTER processing today\'s intraday stop, only if position still open.\n    No fixed TP. At session10 close, time exit has precedence over queued profit exit.\n    Queue profit exit for next open; actual next-open trade may be a loss.\n    """\n    fee=roundtrip_bps/20000\n    if holding_session>=10:return \'EXIT_THIS_CLOSE_MAX_HOLD\'\n    if close*(1-fee)>entry_open*(1+fee):return \'QUEUE_EXIT_NEXT_REGULAR_OPEN\'\n    return \'HOLD_WITH_STOP\'\n\ndef opening_exit(open_price,stop_price,profit_exit_queued):\n    if open_price<=stop_price:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'gap_SL\'}\n    if profit_exit_queued:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'profitable_close_next_open\'}\n    return {\'exit\':False}\n\ndef main():\n    p=argparse.ArgumentParser(description=__doc__);p.add_argument(\'--csv\',type=Path,default=Path(\'MRNA_daily_TRADES.csv\'));p.add_argument(\'--asof\',help=\'Last completed regular-session date YYYY-MM-DD\');a=p.parse_args()\n    d=load_csv(a.csv)\n    if a.asof:d=d.loc[:a.asof]\n    print(json.dumps(scan_mrna(d),indent=2,allow_nan=False))\nif __name__==\'__main__\':main()\n')
+wmt = _embedded_scanner('embedded_wmt', '#!/usr/bin/env python3\n"""Frozen WMT synthetic lower rank blend v1 scanner adapter.\nNo broker or internet. Dependencies pandas numpy matplotlib.\npython wmt_synthetic_blend_frozen_v1.py --csv WMT_daily_TRADES.csv\n"""\nimport argparse,json\nfrom pathlib import Path\nimport numpy as np\nimport pandas as pd\ndef wilder(s, n=14):\n    # Wilder seed is arithmetic mean of first n valid observations.\n    out = pd.Series(np.nan, index=s.index)\n    valid = np.flatnonzero(s.notna().to_numpy())\n    if len(valid) < n:\n        return out\n    k = valid[n-1]\n    out.iloc[k] = s.iloc[valid[:n]].mean()\n    for i in range(k+1, len(s)):\n        out.iloc[i] = (out.iloc[i-1]*(n-1)+s.iloc[i])/n\n    return out\n\ndef indicators(d):\n    d = d.copy()\n    for n in [20, 50, 200]:\n        d[f\'sma{n}\'] = d.close.rolling(n).mean()\n    delta = d.close.diff()\n    up, down = wilder(delta.clip(lower=0)), wilder(-delta.clip(upper=0))\n    d[\'rsi\'] = 100 - 100/(1+up/down)\n    d.loc[(up == 0) & (down == 0), \'rsi\'] = 50\n    tr = pd.concat([d.high-d.low, (d.high-d.close.shift()).abs(),\n                    (d.low-d.close.shift()).abs()], axis=1).max(axis=1)\n    d[\'atr\'] = wilder(tr)\n    d[\'prior_high\'] = d.close.shift().rolling(20).max()\n    # Prompt uses current-session volume in its 20-day volume average.\n    d[\'vol20\'] = d.volume.rolling(20).mean()\n    d[\'ret\'] = d.close.pct_change(fill_method=None)\n    return d\n\ndef load_csv(path):\n    import io,csv\n    text=path.read_text(encoding=\'utf-8-sig\')\n    lines=text.splitlines();start=None;sep=\',\'\n    for k,line in enumerate(lines):\n        for delimiter in [\',\',\';\',\'\\t\']:\n            columns=[c.strip().lower().strip(\'"\') for c in next(csv.reader([line],delimiter=delimiter))]\n            if all(c in columns for c in [\'date\',\'open\',\'high\',\'low\',\'close\',\'volume\']):\n                start=k;sep=delimiter;break\n        if start is not None:break\n    if start is None:raise ValueError(str(path)+\': no Date/Open/High/Low/Close/Volume header found\')\n    d=pd.read_csv(io.StringIO(\'\\n\'.join(lines[start:])),sep=sep)\n    d.columns=d.columns.str.strip().str.lower();d[\'date\']=pd.to_datetime(d.date,errors=\'raise\')\n    d[\'date\']=d.date.dt.tz_localize(None).dt.normalize();d=d.set_index(\'date\')[[\'open\',\'high\',\'low\',\'close\',\'volume\']]\n    for c in d.columns:d[c]=pd.to_numeric(d[c].astype(str).str.replace(\',\',\'\',regex=False),errors=\'raise\')\n    d=d.sort_index()\n    if d.index.duplicated().any():raise ValueError(str(path)+\': duplicate dates\')\n    if d.isna().any().any() or (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any():raise ValueError(str(path)+\': invalid prices\')\n    if ((d.high<d[[\'open\',\'close\',\'low\']].max(axis=1))|(d.low>d[[\'open\',\'close\',\'high\']].min(axis=1))).any():raise ValueError(str(path)+\': inconsistent OHLC\')\n    return d\n\n\nCONFIG={\'strategy_id\': \'WMT_CANDLE_SEQUENCE_VOLUME_PRICE_DISTANCE_LOWER_BLEND_V1\', \'ticker\': \'WMT\', \'direction\': \'LONG\', \'indicator\': \'1 - mean(prior_rank(candle_sequence), prior_rank(volume_price_distance))\', \'quantile\': 0.975, \'rank_prior_valid_observations\': 252, \'rank_min_prior_valid_observations\': 200, \'band_valid_observations\': 252, \'band_min_valid_observations\': 200, \'trend\': \'close>SMA200\', \'entry\': \'next_regular_session_open\', \'allocation_fraction\': 0.333, \'stop_ATR_multiple\': 2.0, \'ATR_period\': 14, \'target\': None, \'max_hold_sessions\': 10, \'exit\': \'first strictly net-profitable completed close queues next regular open; gap SL takes priority\', \'lockout_signal_sessions\': 10, \'roundtrip_bps\': 10, \'cash_interest\': 0, \'historical_window\': [\'2016-01-04\', \'2026-10-01\'], \'status\': \'Frozen for forward tracking; matched null unfinished; post-selection significance unconfirmed\', \'reported_audit_10bps\': {\'trades\': 28, \'ending_equity\': 10599.8545, \'win_rate_pct\': 89.2857, \'profit_factor\': 2.8963, \'mean_trade_pct\': 0.6302, \'MaxDD_pct\': -1.8524, \'CAGR_pct\': 0.5437, \'mean_capital_exposure_pct\': 0.6021, \'time_in_market_pct\': 1.8135, \'matched_null_accepted\': 241, \'circular_null_p\': 0.029, \'bonferroni120_p\': 1.0}}\n\ndef prepare_bars(bars):\n    """Caller supplies completed regular-session DAILY WMT bars only. Never fill missing prices.\n    Use the same historical series/warmup as the audit for exact indicator agreement.\n    """\n    d=bars.copy();d.columns=d.columns.str.lower().str.strip()\n    if \'date\' in d:d[\'date\']=pd.to_datetime(d.date);d=d.set_index(\'date\')\n    d.index=pd.DatetimeIndex(d.index).tz_localize(None).normalize();d=d.sort_index()\n    cols=[\'open\',\'high\',\'low\',\'close\',\'volume\'];d=d[cols].apply(pd.to_numeric,errors=\'raise\')\n    if d.index.duplicated().any() or d.isna().any().any():raise ValueError(\'Duplicate dates or missing OHLCV; no price filling permitted\')\n    if (d[[\'open\',\'high\',\'low\',\'close\']]<=0).any().any() or (d.volume<0).any():raise ValueError(\'Invalid price/volume\')\n    if ((d.high<d[[\'open\',\'low\',\'close\']].max(axis=1))|(d.low>d[[\'open\',\'high\',\'close\']].min(axis=1))).any():raise ValueError(\'Invalid OHLC ordering\')\n    return indicators(d)\n\ndef signal_history(completed_daily_bars):\n    d=prepare_bars(completed_daily_bars)\n    def div(x,y):return x/y.where(y.abs()>1e-8)\n    rv=div(d.volume,d.vol20)\n    candle=(div(d.close-d.open,d.atr)*rv).rolling(5).sum()\n    typical=(d.high+d.low+d.close)/3\n    vwap=div((typical*d.volume).rolling(20).sum(),d.volume.rolling(20).sum())\n    distance=div(div(d.close-vwap,d.atr),rv)\n    def rank(z):\n        return z.replace([np.inf,-np.inf],np.nan).dropna().rolling(253,min_periods=201).apply(lambda v:np.mean(v[:-1]<=v[-1]),raw=True).reindex(d.index)\n    value=1-(rank(candle)+rank(distance))/2\n    band=value.dropna().shift(1).rolling(252,min_periods=200).quantile(.975).reindex(d.index)\n    raw=((value>band)&(d.close>d.sma200)&value.notna()&band.notna()&(d.atr>0)).fillna(False)\n    accepted=np.zeros(len(d),dtype=bool);next_allowed=0\n    for j in np.flatnonzero(raw.to_numpy()):\n        if j>=next_allowed:accepted[j]=True;next_allowed=j+10\n    d[\'synthetic_indicator\']=value;d[\'upper_band\']=band;d[\'raw_signal\']=raw;d[\'accepted_signal\']=accepted\n    return d\n\ndef scan_wmt(completed_daily_bars,has_open_position=False):\n    """Master integration: call after full daily close. No live/partial candle allowed.\n    Returns signal only; master controls available cash/slots, order submission and calendar.\n    Accepted signals retain frozen H10 lockout even if trade exited earlier or master skipped it.\n    """\n    d=signal_history(completed_daily_bars)\n    if not len(d):raise ValueError(\'No bars\')\n    row=d.iloc[-1];j=len(d)-1;prior=np.flatnonzero(d.accepted_signal.to_numpy()[:j]);last=int(prior[-1]) if len(prior) else None\n    cooldown=last is not None and j<last+10\n    ready=bool(np.isfinite(row.upper_band) and np.isfinite(row.atr) and np.isfinite(row.sma200))\n    buy=ready and bool(row.accepted_signal) and not has_open_position\n    status=\'BUY_NEXT_REGULAR_OPEN\' if buy else (\'POSITION_OPEN\' if has_open_position else (\'WARMUP\' if not ready else (\'COOLDOWN\' if cooldown else \'NO_SIGNAL\')))\n    return {\'strategy_id\':CONFIG[\'strategy_id\'],\'ticker\':\'WMT\',\'signal_date\':str(d.index[-1].date()),\'status\':status,\'buy_signal\':buy,\n      \'indicator\':float(row.synthetic_indicator) if pd.notna(row.synthetic_indicator) else None,\n      \'upper_band\':float(row.upper_band) if pd.notna(row.upper_band) else None,\'close\':float(row.close),\n      \'SMA200\':float(row.sma200) if pd.notna(row.sma200) else None,\'signal_ATR14\':float(row.atr) if pd.notna(row.atr) else None,\n      \'raw_signal\':bool(row.raw_signal),\'cooldown_sessions_remaining\':max(0,last+10-j) if last is not None else 0,\n      \'entry_plan\':{\'when\':\'next_regular_session_open\',\'allocation_fraction\':0.333,\'SL_formula\':\'actual_entry_open - 2 * signal_ATR14\',\'TP\':None,\'max_hold_sessions\':10,\'entry_session_counts_as\':1} if buy else None}\n\ndef build_entry(actual_entry_open,signal_ATR14,current_equity,available_cash,roundtrip_bps=10):\n    """Only call on execution day with actual opening price and frozen signal-day ATR."""\n    op=float(actual_entry_open);atr=float(signal_ATR14);fee=roundtrip_bps/20000;cost=.333*current_equity\n    if not np.isfinite(op) or not np.isfinite(atr) or atr<=0 or op-2*atr<=0:raise ValueError(\'Invalid entry or stop\')\n    if available_cash+1e-8<cost:return {\'status\':\'SKIP_INSUFFICIENT_CASH\'}\n    return {\'status\':\'ENTRY_PLAN\',\'entry_open\':op,\'SL\':op-2*atr,\'TP\':None,\'shares\':cost/(op*(1+fee)),\'entry_budget_including_cost\':cost,\'roundtrip_bps\':roundtrip_bps}\n\ndef completed_close_exit_signal(close,entry_open,holding_session,roundtrip_bps=10):\n    """Call AFTER processing today\'s intraday stop, only if position still open.\n    No fixed TP. At session10 close, time exit has precedence over queued profit exit.\n    Queue profit exit for next open; actual next-open trade may be a loss.\n    """\n    fee=roundtrip_bps/20000\n    if holding_session>=10:return \'EXIT_THIS_CLOSE_MAX_HOLD\'\n    if close*(1-fee)>entry_open*(1+fee):return \'QUEUE_EXIT_NEXT_REGULAR_OPEN\'\n    return \'HOLD_WITH_STOP\'\n\ndef opening_exit(open_price,stop_price,profit_exit_queued):\n    if open_price<=stop_price:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'gap_SL\'}\n    if profit_exit_queued:return {\'exit\':True,\'fill\':float(open_price),\'reason\':\'profitable_close_next_open\'}\n    return {\'exit\':False}\n\ndef main():\n    p=argparse.ArgumentParser(description=__doc__);p.add_argument(\'--csv\',type=Path,default=Path(\'WMT_daily_TRADES.csv\'));p.add_argument(\'--asof\',help=\'Last completed regular-session date YYYY-MM-DD\');a=p.parse_args()\n    d=load_csv(a.csv)\n    if a.asof:d=d.loc[:a.asof]\n    print(json.dumps(scan_wmt(d),indent=2,allow_nan=False))\nif __name__==\'__main__\':main()\n')
+MODULES={'IBM':ibm,'CRWD':crwd,'MRNA':mrna,'WMT':wmt}
+
+@st.cache_data(ttl=900)
+def schedule(start,end):
+    return mcal.get_calendar('NYSE').schedule(start_date=start,end_date=end)
+
+@st.cache_data(ttl=900)
+def fetch_daily_batch():
+    # One concurrent request batch, bounded individual download timeout.
+    z=yf.download(['IBM','CRWD','MRNA','WMT'],start='2014-01-01',interval='1d',auto_adjust=False,prepost=False,progress=False,threads=True,timeout=10,group_by='ticker')
+    output={}
+    for ticker in MODULES:
+        try:
+            t=z[ticker].copy() if isinstance(z.columns,pd.MultiIndex) else z.copy()
+            t.columns=t.columns.str.lower();t.index=pd.DatetimeIndex(t.index).tz_localize(None).normalize()
+            t=t[['open','high','low','close','volume']].dropna(how='all')
+            if not t.empty:output[ticker]=t
+        except (KeyError,ValueError):pass
+    return output
+
+def fetch_daily(ticker):
+    batch=fetch_daily_batch()
+    if ticker not in batch:raise ValueError('Yahoo download failed or timed out. Refresh or upload the cached IBKR CSV.')
+    return batch[ticker]
+
+def complete_only(d):
+    """Calendar close handles holidays, early closes, DST and partial current candles."""
+    now=pd.Timestamp.now(tz='UTC');ss=schedule(d.index.min().date(),datetime.now(NY).date())
+    dates=ss.index[ss.market_close+pd.Timedelta(minutes=5)<=now].tz_localize(None).normalize()
+    return d.loc[d.index.isin(dates)]
+
+def future_dates(day):
+    ss=schedule(day+pd.Timedelta(days=1),day+pd.Timedelta(days=50)).index
+    return ss[0],ss[9]
+
+@st.cache_data(ttl=900)
+def replay(ticker,d):
+    """One-position hypothetical replay; only observed exits are called closed.
+    No future H10 eligibility filter for live dates. Synthetic entries retain H10 lockout.
+    """
+    module=MODULES[ticker]
+    f=module.signal_history(d);position=None;rows=[]
+    for j,(day,b) in enumerate(f.iterrows()):
+        if day<pd.Timestamp('2016-01-01'):continue
+        if position:
+            position['sessions']+=1
+            x=module.opening_exit(b.open,position['stop'],position['queued'])
+            if x['exit']:
+                rows.append(finish(position,day,x['fill'],x['reason']));position=None
+        if position is None and j and bool(f.accepted_signal.iloc[j-1]):
+            atr=float(f.atr.iloc[j-1]);entry=float(b.open)
+            if entry-2*atr>0:
+                position={'signal_date':f.index[j-1],'entry_date':day,'entry':entry,'stop':entry-2*atr,'sessions':1,'queued':False}
+        if position:
+            if b.low<=position['stop']:
+                rows.append(finish(position,day,position['stop'],'intraday_SL'));position=None
+            else:
+                action=module.completed_close_exit_signal(float(b.close),position['entry'],position['sessions'])
+                if action=='EXIT_THIS_CLOSE_MAX_HOLD':
+                    rows.append(finish(position,day,float(b.close),'max_hold'));position=None
+                elif action=='QUEUE_EXIT_NEXT_REGULAR_OPEN':position['queued']=True
+    return f,pd.DataFrame(rows),position
+
+def finish(p,day,price,reason):
+    return {'Signal':p['signal_date'].date(),'Entry date':p['entry_date'].date(),'Entry':p['entry'],'SL':p['stop'],'Exit date':day.date(),'Exit':price,'Return %':100*(price*(1-.0005)/(p['entry']*(1+.0005))-1),'Sessions':p['sessions'],'Reason':reason}
+
+@st.cache_data(ttl=900)
+def synthetic_result(ticker):
+    module=MODULES[ticker];d=complete_only(fetch_daily(ticker))
+    if d.empty:raise ValueError('No completed daily sessions')
+    f,tr,p=replay(ticker,d);r=f.iloc[-1];day=f.index[-1]
+    title='IBM synthetic' if ticker=='IBM' else ticker
+    descriptions={'IBM':'Daily close-location + volume extreme; 2×ATR stop, profitable-close exit. Unlike original IBM: no 4h structure or fixed 2R TP.',
+      'CRWD':'Daily close-location lower extreme above SMA200.',
+      'MRNA':'Daily volume-per-movement upper extreme above SMA200.',
+      'WMT':'Daily candle-sequence + volume/price-distance lower rank blend above SMA200.'}
+    status='NO SIGNAL';detail='No frozen pattern confirmed; no action required.'
+    if p:
+        status='EXIT NEXT OPEN' if p['queued'] else 'MODEL POSITION OPEN'
+        maxday=nth_session(p['entry_date'],10)
+        detail=f"Model entry ${p['entry']:.2f} | SL ${p['stop']:.2f} | holding session {p['sessions']} | max exit {maxday.date()}"
+        if p['queued']:detail+=' | first net-profitable close reached: exit next regular open'
+    elif bool(r.accepted_signal):
+        status='SIGNAL';entryday,maxday=future_dates(day)
+        detail=f"LONG next open {entryday.date()} | SL = actual entry − ${2*r.atr:.2f} | no fixed TP | max exit {maxday.date()}"
+    elif bool(r.raw_signal):detail='Frozen 10-session lockout: no new entry.'
+    band=r.get('upper_band',r.get('lower_band',np.nan))
+    if not np.isfinite(band):detail='Indicator warmup incomplete; no action.'
+    return {'ticker':title,'status':status,'detail':detail,'date':day.date(),'close':float(r.close),
+      'extra':descriptions[ticker]+' All synthetic trades: 33.3% equity including costs; max 10 sessions.',
+      'trades':tr,'config':module.CONFIG}
+
+# ---------------- UI ----------------
+st.title("Frozen Signal Scanner")
+st.caption("IBM original + IBM synthetic + WFC + V + AAPL + GOOG + CRWD + MRNA + WMT — frozen rules; synthetic candidates are for forward tracking.")
+
+results=[]
+for name,fn in [("IBM",scan_ibm),("IBM synthetic",lambda:synthetic_result("IBM")),("WFC",scan_wfc),("V",scan_v),("AAPL",scan_aapl),("GOOG",scan_goog),("CRWD",lambda:synthetic_result("CRWD")),("MRNA",lambda:synthetic_result("MRNA")),("WMT",lambda:synthetic_result("WMT"))]:
+    try:
+        results.append(fn())
+    except Exception as e:
+        results.append({"ticker":name,"status":"DATA ERROR","detail":str(e),"date":"—","close":np.nan,"extra":""})
+
+st.subheader("Scanner")
+st.caption("Synthetic allocation: 33.3% of current equity per entry, including 10 bps round-trip costs. Check shared cash and at most 3 positions before entry.")
+for r in results:
+    icon={"SIGNAL":"🟢","ENTRY":"🟢","VERIFY":"🟡","EXIT NEXT OPEN":"🟢","MODEL POSITION OPEN":"🟡","NO SIGNAL":"⚪","DATA ERROR":"🔴"}.get(r["status"],"⚪")
+    price=f"${r['close']:.2f}" if np.isfinite(r["close"]) else "—"
+    with st.container(border=True):
+        c1,c2,c3=st.columns([1,1.2,1])
+        c1.markdown(f"### {r['ticker']}")
+        c2.markdown(f"**{icon} {r['status']}**")
+        c3.metric("Latest close",price)
+        st.write(r["detail"])
+        if r["extra"]: st.caption(r["extra"])
+        if 'trades' in r:
+            with st.expander('Latest 5 closed model trades'):
+                if r['trades'].empty:st.write('No closed trades in available data.')
+                else:st.dataframe(r['trades'].tail(5).round(4),hide_index=True,use_container_width=True)
+            st.caption('Model replay assumes entries were taken; verify your actual position before acting. Shared portfolio cash/slots are not tracked.')
+
+st.divider()
+tabs=st.tabs(["IBM","WFC","V","AAPL","GOOG"])
+with tabs[0]:
+    st.markdown("### IBM frozen rule")
+    st.write("Daily LH+LL + synthetic 4h HH+HL → LONG next open → latest confirmed 4h swing-low SL → 2R TP → max 10 sessions.")
+with tabs[1]:
+    st.markdown("### WFC frozen rule")
+    st.write("Every confirmed WFC earnings release → LONG at the next regular-session open after the release → SL = entry − 2×ATR(14) → TP = 2R → max 5 sessions.")
+    st.warning("Yahoo's earnings calendar may not reliably distinguish before-open from after-close. Verify the actual release timing before entering.")
+with tabs[2]:
+    st.markdown("### V frozen rule")
+    st.write("Bearish daily candle whose low is within 0.75% of the prior 20-session low → LONG next open → SL = entry − 2×ATR(14) → TP = 2R → max 3 sessions.")
+with tabs[3]:
+    st.markdown("### AAPL frozen rule")
+    st.write("Bullish daily candle closes above the prior 20-session high after at least 2 prior resistance touches → LONG next open → SL = entry − 1.5×ATR(14) → TP = 2R → max 10 sessions.")
+with tabs[4]:
+    st.markdown("### GOOG frozen rule")
+    st.write("Wednesday signal after the prior completed daily candle was down → wait for Wednesday close → LONG at the next regular-session open → SL = entry − 2×ATR(14) → TP = 2R → max 10 sessions.")
+
+st.caption("Cloud data: Yahoo Finance. Historical validation used IBKR data, so cloud signals should be treated as monitoring signals and checked for provider differences.")
